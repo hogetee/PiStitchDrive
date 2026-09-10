@@ -106,6 +106,12 @@ def send_to_pipe(char):
 #OLED--------------------------------------------------------------------------------
 i2c = busio.I2C(board.SCL, board.SDA)
 display = adafruit_ssd1306.SSD1306_I2C(128, 32, i2c)
+display_lock = threading.Lock()
+scroll_thread = None
+scroll_stop_event = threading.Event()
+OLED_FRAME_DELAY = 0.15
+OLED_PIXEL_STEP = 3
+OLED_LOOP_PAUSE = 1.0
 
 # โหลดฟอนต์
 font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -125,8 +131,9 @@ def draw_text(text):
     y = max((display.height - text_height) // 2 - bbox[1], 0)  # ✅ ปรับให้ไม่ตกขอบล่าง
 
     draw.text((x, y), text, font=font, fill=255)
-    display.image(image)
-    display.show()
+    with display_lock:
+        display.image(image)
+        display.show()
 
 def reset_pipe(pipe_path="/tmp/keypad_pipe"):
     try:
@@ -138,16 +145,12 @@ def reset_pipe(pipe_path="/tmp/keypad_pipe"):
     except Exception as e:
         print(f"❌ เกิดข้อผิดพลาดขณะ reset pipe: {e}")
 
-def scroll_text_background(text, speed=0.0001):
-    thread = threading.Thread(target=scroll_text, args=(text, speed))
-    thread.daemon = True  # ให้ปิดอัตโนมัติเมื่อโปรแกรมหลักจบ
-    thread.start()
+def scroll_text_background(text, speed=OLED_FRAME_DELAY):
+    start_scroll(text, speed)
 
-scrolling = False
-
-def scroll_text_controlled(text, speed=0.0001):
-    global scrolling
-    scrolling = True
+def scroll_text_controlled(text, speed=OLED_FRAME_DELAY, stop_event=None):
+    if stop_event is None:
+        stop_event = scroll_stop_event
 
     thaifont = ImageFont.truetype("/usr/share/fonts/truetype/tlwg/Kinnari.ttf", 24)
 
@@ -158,59 +161,95 @@ def scroll_text_controlled(text, speed=0.0001):
     text_height = bbox[3] - bbox[1]
     y = max((display.height - text_height) // 2 - bbox[1], 0)
 
+    if stop_event.is_set():
+        return
+
     if text_width <= display.width:
         # ถ้าข้อความสั้น แสดงอยู่ตรงกลางนิ่งๆ
         image = Image.new("1", (display.width, display.height))
         draw = ImageDraw.Draw(image)
         x = (display.width - text_width) // 2
         draw.text((x, y), text, font=thaifont, fill=255)
-        display.image(image)
-        display.show()
+        with display_lock:
+            display.image(image)
+            display.show()
         return
 
     # ข้อความยาว → scroll จาก x=0 ไป x=-(text_width - display.width)
     start_x = 0
     end_x = -(text_width - display.width)
 
-    while scrolling:
-        for offset in range(start_x, end_x - 1, -1):
-            if not scrolling:
+    while not stop_event.is_set():
+        for offset in range(start_x, end_x - 1, -OLED_PIXEL_STEP):
+            if stop_event.is_set():
                 break
             image = Image.new("1", (display.width, display.height))
             draw = ImageDraw.Draw(image)
             draw.text((offset, y), text, font=thaifont, fill=255)
-            display.image(image)
-            display.show()
-            time.sleep(speed)
+            with display_lock:
+                display.image(image)
+                display.show()
+            stop_event.wait(speed)
+        stop_event.wait(OLED_LOOP_PAUSE)
 
 
 
-def start_scroll(text):
-    thread = threading.Thread(target=scroll_text_controlled, args=(text,))
-    thread.daemon = True
-    thread.start()
+def start_scroll(text, speed=OLED_FRAME_DELAY):
+    global scroll_thread, scroll_stop_event
+    stop_scroll()
+    if scroll_thread is not None and scroll_thread.is_alive():
+        print("⚠️ OLED scroll เดิมยังหยุดไม่สนิท จึงไม่สร้าง thread เพิ่ม")
+        return
+    scroll_stop_event = threading.Event()
+    scroll_thread = threading.Thread(
+        target=scroll_text_controlled,
+        args=(text, speed, scroll_stop_event),
+        daemon=True,
+    )
+    scroll_thread.start()
 
 def stop_scroll():
-    global scrolling
-    scrolling = False
+    global scroll_thread
+    scroll_stop_event.set()
+    thread = scroll_thread
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=2.0)
+    if thread is None or not thread.is_alive():
+        scroll_thread = None
+
 def clear_display():
     image = Image.new("1", (display.width, display.height))
-    display.image(image)
-    display.show()
+    with display_lock:
+        display.image(image)
+        display.show()
+
+
+IDLE_MESSAGE = "กด -> เพื่อเริ่มต้น หรือ กด * เพื่อปิดเครื่อง"
+MOUNT_SCRIPT = "/home/tee/Desktop/dbindex/mount.py"
+
+def show_idle_state():
+    stop_all()
+    GPIO.output(RED, GPIO.LOW)
+    GPIO.output(YELLOW, GPIO.LOW)
+    GPIO.output(GREEN, GPIO.HIGH)
+    stop_scroll()
+    clear_display()
+    start_scroll(IDLE_MESSAGE)
 
 
 #--------------------------------------------------------------------------------
 
 try:
     last_key = None
+    mount_process = None
     init_led()
-    GPIO.output(RED, GPIO.LOW)
-    GPIO.output(YELLOW, GPIO.LOW)
-    GPIO.output(GREEN, GPIO.HIGH)
-    stop_scroll()
-    clear_display()
-    start_scroll("กด -> เพื่อเริ่มต้น หรือ กด * เพื่อปิดเครื่อง")
+    show_idle_state()
     while True:
+        if mount_process is not None and mount_process.poll() is not None:
+            print(f"✅ mount.py จบการทำงานด้วยรหัส {mount_process.returncode}")
+            mount_process = None
+            show_idle_state()
+
         key = scan_keypad()
         if key and key != last_key:
             print("🔘 กด:", key)
@@ -225,27 +264,30 @@ try:
                 subprocess.run(["sudo", "shutdown", "-h", "now"])
 
             elif key == "→":
-                # ตรวจสอบว่า testmou.py กำลังทำงานอยู่หรือไม่
-                stop_scroll()
-                clear_display()
-                GPIO.output(GREEN, GPIO.LOW)
-                GPIO.output(YELLOW, GPIO.HIGH)
+                # Do not start a second mount job while one is active.
+                if mount_process is not None and mount_process.poll() is None:
+                    print("⚠️ mount.py กำลังทำงานอยู่แล้ว จึงไม่เปิดซ้ำ")
+                    last_key = key
+                    continue
+
                 result = subprocess.run(
-                    ["pgrep", "-f", "testmou.py"],
+                    ["pgrep", "-f", "[/]home/tee/Desktop/dbindex/mount[.]py"],
                     stdout=subprocess.PIPE,
                     text=True
                 )
 
                 if result.stdout:
-                    pids = result.stdout.strip().split("\n")
-                    for pid in pids:
-                        print(f"🛑 ฆ่า testmou.py PID: {pid}")
-                        subprocess.run(["sudo", "kill", "-9", pid])
-                    time.sleep(0.5)  # รอให้เคลียร์ก่อนรันใหม่
+                    print("⚠️ mount.py กำลังทำงานอยู่แล้ว จึงไม่เปิดซ้ำ")
+                    last_key = key
+                    continue
 
-                print("🚀 เริ่มรัน testmou.py ใหม่")
-                subprocess.Popen(
-                    ["python3", "/home/tee/Desktop/dbindex/mount.py"],
+                stop_scroll()
+                clear_display()
+                GPIO.output(GREEN, GPIO.LOW)
+                GPIO.output(YELLOW, GPIO.HIGH)
+                print("🚀 เริ่มรัน mount.py ใหม่")
+                mount_process = subprocess.Popen(
+                    [sys.executable, MOUNT_SCRIPT],
                     start_new_session=True
                 )
 

@@ -1,14 +1,15 @@
 import os
 import shutil
-import re
 
 import subprocess
 import json
 import time
+import tempfile
 
 import sys
 import termios
 import tty
+import fcntl
 import board
 import busio
 from PIL import Image, ImageDraw, ImageFont
@@ -22,6 +23,12 @@ import threading
 #OLED--------------------------------------------------------------------------------
 i2c = busio.I2C(board.SCL, board.SDA)
 display = adafruit_ssd1306.SSD1306_I2C(128, 32, i2c)
+display_lock = threading.Lock()
+scroll_thread = None
+scroll_stop_event = threading.Event()
+OLED_FRAME_DELAY = 0.15
+OLED_PIXEL_STEP = 3
+OLED_LOOP_PAUSE = 1.0
 
 # โหลดฟอนต์
 font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -41,8 +48,9 @@ def draw_text(text):
     y = max((display.height - text_height) // 2 - bbox[1], 0)  # ✅ ปรับให้ไม่ตกขอบล่าง
 
     draw.text((x, y), text, font=font, fill=255)
-    display.image(image)
-    display.show()
+    with display_lock:
+        display.image(image)
+        display.show()
 
 def reset_pipe(pipe_path="/tmp/keypad_pipe"):
     try:
@@ -66,27 +74,35 @@ def realtime_input():
 
     first_input = True  # ✅ เพิ่ม flag ว่าเพิ่งเริ่มรับข้อความ
 
-    with open(pipe_path, "r") as pipe:
-        while True:
-            char = pipe.read(1)
-            if not char:
-                continue
+    # The keypad daemon opens the FIFO for one key and then closes it.  When
+    # the writer closes, read() returns EOF; reopen the FIFO so the process
+    # blocks for the next key instead of spinning at 100% CPU.
+    while True:
+        try:
+            with open(pipe_path, "r", encoding="utf-8") as pipe:
+                while True:
+                    char = pipe.read(1)
+                    if not char:
+                        break
 
-            # ✅ เคลียร์จอเมื่อเริ่มข้อความใหม่
-            if first_input:
-                clear_display()
-                first_input = False
+                    # ✅ เคลียร์จอเมื่อเริ่มข้อความใหม่
+                    if first_input:
+                        clear_display()
+                        first_input = False
 
-            if char == "←":
-                text = text[:-1]
-            elif char == "E":
-                if pipe.read(2) == "nt":
-                    draw_text("")  # เคลียร์จอ
-                    return text
-            else:
-                text += char
+                    if char == "←":
+                        text = text[:-1]
+                    elif char == "E":
+                        if pipe.read(2) == "nt":
+                            draw_text("")  # เคลียร์จอ
+                            return text
+                    else:
+                        text += char
 
-            draw_text(text)
+                    draw_text(text)
+        except FileNotFoundError:
+            reset_pipe(pipe_path)
+            time.sleep(0.1)
 
 
     print("\n👋 ออกจาก realtime input")
@@ -94,27 +110,30 @@ def realtime_input_check_special():
     pipe_path = "/tmp/keypad_pipe"
     reset_pipe(pipe_path)
 
-    with open(pipe_path, "r") as pipe:
-        while True:
-            char = pipe.read(1)
-            if not char:
-                continue
+    # Reopen after EOF so an idle process sleeps in open() instead of busy
+    # looping after the keypad daemon closes its one-key writer.
+    while True:
+        try:
+            with open(pipe_path, "r", encoding="utf-8") as pipe:
+                while True:
+                    char = pipe.read(1)
+                    if not char:
+                        break
 
-            if char == "E":
-                next_chars = pipe.read(2)
-                if next_chars == "sc":
-                    return True
+                    if char == "E":
+                        next_chars = pipe.read(2)
+                        if next_chars == "sc":
+                            return True
+        except FileNotFoundError:
+            reset_pipe(pipe_path)
+            time.sleep(0.1)
 
-def scroll_text_background(text, speed=0.02):
-    thread = threading.Thread(target=scroll_text, args=(text, speed))
-    thread.daemon = True  # ให้ปิดอัตโนมัติเมื่อโปรแกรมหลักจบ
-    thread.start()
+def scroll_text_background(text, speed=OLED_FRAME_DELAY):
+    start_scroll(text, speed)
 
-scrolling = False
-
-def scroll_text_controlled(text, speed=0.001):
-    global scrolling
-    scrolling = True
+def scroll_text_controlled(text, speed=OLED_FRAME_DELAY, stop_event=None):
+    if stop_event is None:
+        stop_event = scroll_stop_event
 
     thaifont = ImageFont.truetype("/usr/share/fonts/truetype/tlwg/Kinnari.ttf", 24)
 
@@ -125,45 +144,68 @@ def scroll_text_controlled(text, speed=0.001):
     text_height = bbox[3] - bbox[1]
     y = max((display.height - text_height) // 2 - bbox[1], 0)
 
+    if stop_event.is_set():
+        return
+
     if text_width <= display.width:
         # ถ้าข้อความสั้น แสดงอยู่ตรงกลางนิ่งๆ
         image = Image.new("1", (display.width, display.height))
         draw = ImageDraw.Draw(image)
         x = (display.width - text_width) // 2
         draw.text((x, y), text, font=thaifont, fill=255)
-        display.image(image)
-        display.show()
+        with display_lock:
+            display.image(image)
+            display.show()
         return
 
     # ข้อความยาว → scroll จาก x=0 ไป x=-(text_width - display.width)
     start_x = 0
     end_x = -(text_width - display.width)
 
-    while scrolling:
-        for offset in range(start_x, end_x - 1, -1):
-            if not scrolling:
+    while not stop_event.is_set():
+        for offset in range(start_x, end_x - 1, -OLED_PIXEL_STEP):
+            if stop_event.is_set():
                 break
             image = Image.new("1", (display.width, display.height))
             draw = ImageDraw.Draw(image)
             draw.text((offset, y), text, font=thaifont, fill=255)
-            display.image(image)
-            display.show()
-            time.sleep(speed)
+            with display_lock:
+                display.image(image)
+                display.show()
+            stop_event.wait(speed)
+        stop_event.wait(OLED_LOOP_PAUSE)
 
 
 
-def start_scroll(text):
-    thread = threading.Thread(target=scroll_text_controlled, args=(text,))
-    thread.daemon = True
+def start_scroll(text, speed=OLED_FRAME_DELAY):
+    global scroll_thread, scroll_stop_event
+    stop_scroll()
+    if scroll_thread is not None and scroll_thread.is_alive():
+        print("⚠️ OLED scroll เดิมยังหยุดไม่สนิท จึงไม่สร้าง thread เพิ่ม")
+        return
+    scroll_stop_event = threading.Event()
+    thread = threading.Thread(
+        target=scroll_text_controlled,
+        args=(text, speed, scroll_stop_event),
+        daemon=True,
+    )
+    scroll_thread = thread
     thread.start()
 
 def stop_scroll():
-    global scrolling
-    scrolling = False
+    global scroll_thread
+    scroll_stop_event.set()
+    thread = scroll_thread
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=2.0)
+    if thread is None or not thread.is_alive():
+        scroll_thread = None
+
 def clear_display():
     image = Image.new("1", (display.width, display.height))
-    display.image(image)
-    display.show()
+    with display_lock:
+        display.image(image)
+        display.show()
 
 
 #--------------------------------------------------------------------------------
@@ -216,6 +258,10 @@ def close():
 
 USB_IMG_PATH = "/home/tee/Desktop/dbindex/usb.img"
 USB_MOUNT_PATH = "/mnt/usbimg" 
+MOUNT_SETTLE_DELAY = 0.1
+UNMOUNT_SETTLE_DELAY = 0.1
+GADGET_READY_DELAY = 5.0
+COMPLETION_DISPLAY_DELAY = 0.5
 flash_path = None
 def find_usb_flash_mount():
     attempts = 0
@@ -259,11 +305,9 @@ def mount_image():
     uid = str(os.getuid())
     gid = str(os.getgid())
 
-    # ล้าง loop device ที่อาจค้าง
+    # Unmount only this image.  Do not detach every loop device on the Pi.
     subprocess.run(["sudo", "umount", USB_MOUNT_PATH], stderr=subprocess.DEVNULL)
-    subprocess.run(["sudo", "losetup", "-D"], stderr=subprocess.DEVNULL)
-    subprocess.run(["sync"])
-    time.sleep(0.3)  # รอ flush system
+    time.sleep(MOUNT_SETTLE_DELAY)
 
     # ลอง mount
     subprocess.run([
@@ -277,48 +321,46 @@ def mount_image():
 def unmount_image():
     print("✅ Unmounting image...")
     subprocess.run(["sudo", "umount", USB_MOUNT_PATH], check=True)
-    subprocess.run(["sync"])
-    time.sleep(1.0) 
+    time.sleep(UNMOUNT_SETTLE_DELAY)
 
 def copy_dst_files(folder_name):
     src_path = os.path.join(PATTERN_ROOT, folder_name)
     dst_path = USB_MOUNT_PATH
 
-    # ลบทุกอย่างใน usb.img ก่อน
-    for f in os.listdir(dst_path):
-        f_path = os.path.join(dst_path, f)
-        if os.path.isfile(f_path) or os.path.islink(f_path):
-            os.remove(f_path)
-        elif os.path.isdir(f_path):
-            shutil.rmtree(f_path)
-
-    # คัดลอกโครงสร้างและไฟล์ทั้งหมดจาก src → dst
-    for root, dirs, files in os.walk(src_path):
-        rel_path = os.path.relpath(root, src_path)
-        dest_dir = os.path.join(dst_path, rel_path)
-        os.makedirs(dest_dir, exist_ok=True)
-
-        for f in files:
-            # 🔒 ทำชื่อไฟล์ให้ปลอดภัยก่อน
-            safe_name = re.sub(r'[^\w\-.]', '_', f)
-            src_file = os.path.join(root, f)
-            dst_file = os.path.join(dest_dir, safe_name)
-
-            try:
-                shutil.copy2(src_file, dst_file)
-            except OSError as e:
-                start_blink("red")
-                stop_scroll()
-                clear_display()
-                start_scroll("ไฟล์เสีย")
-                print(f"❌ Error copying '{src_file}' → '{dst_file}': {e}")
+    # Keep unchanged files in place.  This is much faster for repeated slots
+    # containing hundreds of small DST files and reduces SD-card writes.
+    try:
+        subprocess.run([
+            "rsync",
+            "-rt",
+            "--whole-file",
+            "--checksum",
+            "--delete",
+            "--delete-excluded",
+            "--modify-window=2",
+            "--no-perms",
+            "--no-owner",
+            "--no-group",
+            "--omit-dir-times",
+            "--exclude=.DS_Store",
+            "--exclude=._*",
+            f"{src_path}/",
+            f"{dst_path}/",
+        ], check=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        start_blink("red")
+        stop_scroll()
+        clear_display()
+        start_scroll("ไฟล์เสีย")
+        print(f"❌ Error syncing '{src_path}' → '{dst_path}': {e}")
+        raise
 
     print(f"📁 คัดลอกโฟลเดอร์ '{folder_name}' → usb.img สำเร็จ")
 
 def create_usb_image():
     if os.path.exists(USB_IMG_PATH):
-        print("🧹 ลบ usb.img เก่า...")
-        os.remove(USB_IMG_PATH)
+        print("📦 ใช้ usb.img เดิม (ไม่ลบข้อมูลที่อาจค้างอยู่)")
+        return
 
     print("🛠️  สร้าง usb.img ขนาด 64MB...")
     subprocess.run(["dd", "if=/dev/zero", f"of={USB_IMG_PATH}", "bs=1M", "count=64"], check=True)
@@ -327,41 +369,109 @@ def create_usb_image():
     subprocess.run(["sync"])
     print("✅ usb.img พร้อมใช้งาน\n")
 
-def save_back_from_usb(idx):
+
+mount_lock_file = None
+
+def acquire_mount_lock():
+    global mount_lock_file
+    mount_lock_file = open("/tmp/pistitchdrive-mount.lock", "w")
+    try:
+        fcntl.flock(mount_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        mount_lock_file.close()
+        mount_lock_file = None
+        print("⚠️ mount.py กำลังทำงานอยู่แล้ว จึงไม่เปิดซ้ำ")
+        return False
+    return True
+
+def release_mount_lock():
+    global mount_lock_file
+    if mount_lock_file is not None:
+        fcntl.flock(mount_lock_file.fileno(), fcntl.LOCK_UN)
+        mount_lock_file.close()
+        mount_lock_file = None
+
+def save_back_from_usb(folder_name):
+    target_dir = os.path.join(PATTERN_ROOT, folder_name)
+    rollback_root = os.path.join(os.path.dirname(PATTERN_ROOT), ".slot-backups")
+    os.makedirs(rollback_root, exist_ok=True)
+    previous_dir = os.path.join(rollback_root, folder_name)
+    staging_dir = tempfile.mkdtemp(
+        prefix=f".{folder_name}.incoming-",
+        dir=PATTERN_ROOT,
+    )
+    image_mounted = False
+
     try:
         subprocess.run(["sudo", "modprobe", "-r", "g_mass_storage"], check=True)
-        time.sleep(0.5)
+        time.sleep(MOUNT_SETTLE_DELAY)
 
         mount_image()
+        image_mounted = True
         print("📥 ดึงไฟล์กลับจาก usb.img...")
 
-        # โฟลเดอร์เป้าหมาย เช่น 01, 02
-        target_dir = os.path.join(PATTERN_ROOT, idx.zfill(4))
+        # Copy to a staging directory first.  The current slot is untouched
+        # until every file has been copied and verified.
+        subprocess.run([
+            "rsync",
+            "-rt",
+            "--whole-file",
+            "--no-perms",
+            "--no-owner",
+            "--no-group",
+            "--omit-dir-times",
+            f"{USB_MOUNT_PATH}/",
+            f"{staging_dir}/",
+        ], check=True)
 
-        # สร้างถ้ายังไม่มี
-        os.makedirs(target_dir, exist_ok=True)
-
-        # ลบไฟล์เดิมก่อน
-        for f in os.listdir(target_dir):
-            f_path = os.path.join(target_dir, f)
-            if os.path.isfile(f_path) or os.path.islink(f_path):
-                os.remove(f_path)
-            elif os.path.isdir(f_path):
-                shutil.rmtree(f_path)
-
-        # คัดลอกกลับ
-        for item in os.listdir(USB_MOUNT_PATH):
-            s = os.path.join(USB_MOUNT_PATH, item)
-            d = os.path.join(target_dir, item)
-            if os.path.isdir(s):
-                shutil.copytree(s, d)
-            else:
-                shutil.copy2(s, d)
+        verification = subprocess.run([
+            "rsync",
+            "-rcn",
+            "--delete",
+            "--itemize-changes",
+            "--no-perms",
+            "--no-owner",
+            "--no-group",
+            f"{USB_MOUNT_PATH}/",
+            f"{staging_dir}/",
+        ], check=True, capture_output=True, text=True)
+        if verification.stdout.strip():
+            raise RuntimeError("ไฟล์ staging ไม่ตรงกับ usb.img")
 
         unmount_image()
-        print("✅ ดึงไฟล์กลับสำเร็จ")
+        image_mounted = False
+
+        # Keep one recoverable previous version.  Renames are atomic because
+        # staging, target, and previous all live on the same filesystem.
+        if os.path.exists(previous_dir):
+            shutil.rmtree(previous_dir)
+
+        target_existed = os.path.exists(target_dir)
+        if target_existed:
+            os.replace(target_dir, previous_dir)
+
+        try:
+            os.replace(staging_dir, target_dir)
+            staging_dir = None
+        except Exception:
+            if target_existed and os.path.exists(previous_dir) and not os.path.exists(target_dir):
+                os.replace(previous_dir, target_dir)
+            raise
+
+        os.sync()
+        print(f"✅ ดึงไฟล์กลับสำเร็จ และเก็บเวอร์ชันก่อนหน้าไว้ที่ {previous_dir}")
+        return True
     except Exception as e:
         print(f"❌ ดึงไฟล์กลับล้มเหลว: {e}")
+        return False
+    finally:
+        if image_mounted:
+            try:
+                unmount_image()
+            except Exception as unmount_error:
+                print(f"❌ Unmount หลังเกิดข้อผิดพลาดล้มเหลว: {unmount_error}")
+        if staging_dir and os.path.exists(staging_dir):
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 
@@ -402,8 +512,10 @@ def main():
         return
 
     mount_image()
-    copy_dst_files(selected)
-    unmount_image()
+    try:
+        copy_dst_files(selected)
+    finally:
+        unmount_image()
     try:
         # ถอด g_mass_storage ออกก่อน (จะ error ถ้ายังไม่ได้โหลด ก็จับไว้)
         subprocess.run(["sudo", "modprobe", "-r", "g_mass_storage"], check=False)
@@ -420,7 +532,7 @@ def main():
         stop_scroll()
         clear_display()
         start_scroll(str(idx)+" เสียบเครื่อง")
-        time.sleep(5)
+        time.sleep(GADGET_READY_DELAY)
         print("✅ g_mass_storage ถูกโหลดเรียบร้อย")
     except subprocess.CalledProcessError as e:
         start_blink("red")
@@ -437,17 +549,20 @@ def main():
         if realtime_input_check_special():
             stop_scroll()
             clear_display()
-            save_back_from_usb(idx)
-            start_scroll("เสร็จ")
+            if save_back_from_usb(selected):
+                start_scroll("เสร็จ")
+            else:
+                start_blink("red")
+                start_scroll("บันทึกไม่สำเร็จ")
+            time.sleep(COMPLETION_DISPLAY_DELAY)
             break
-    # reload systemd
-    subprocess.run(["sudo", "systemctl", "daemon-reload"])
-
-    # restart your service
-    subprocess.run(["sudo", "systemctl", "restart", "keypad-daemon"])
 
         
 
 if __name__ == "__main__":
-    main()
-    
+    if acquire_mount_lock():
+        try:
+            main()
+        finally:
+            stop_scroll()
+            release_mount_lock()
