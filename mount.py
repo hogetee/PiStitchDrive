@@ -87,6 +87,7 @@ def realtime_input():
 
                     # ✅ เคลียร์จอเมื่อเริ่มข้อความใหม่
                     if first_input:
+                        stop_scroll()
                         clear_display()
                         first_input = False
 
@@ -491,7 +492,6 @@ def main():
     stop_scroll()
     clear_display()
     start_scroll("ใส่เลขช่อง")
-    stop_scroll()
     idx = realtime_input()
     try:
         if idx != "0":
